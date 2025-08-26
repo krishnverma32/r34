@@ -1,757 +1,1080 @@
+import os
+import asyncio
+import random
+import logging
+from typing import Dict, List, Optional, Union
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import Enum
+import hashlib
+import json
+
 import discord
 from discord.ext import commands
 from discord import app_commands
+import praw
 import aiohttp
-import asyncio
-import os
-import random
-import logging
-import re
-import json
-from typing import List, Dict, Optional, Literal
-from datetime import datetime
+import aioredis
+from urllib.parse import quote_plus, urljoin
 
-# Enhanced logging setup
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger("NSFWGames")
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-class GameResult:
-    """Data class for game results"""
-    def __init__(self, title: str, url: str, description: str, rating: str = "N/A", 
-                 price: str = "Free", tags: List[str] = None, image_url: str = None):
-        self.title = title
-        self.url = url
-        self.description = description
-        self.rating = rating
-        self.price = price
-        self.tags = tags or []
-        self.image_url = image_url
+class Platform(Enum):
+    """Supported gaming platforms"""
+    REDDIT = "Reddit"
+    ITCH_IO = "Itch.io"
+    STEAM = "Steam"
+    VNDB = "VNDB"
+    NUTAKU = "Nutaku"
+    DLSITE = "DLsite"
+    F95ZONE = "F95Zone"
 
-class NSFWGames(commands.Cog):
-    """🔥 Advanced NSFW Games Discovery Bot 🎮"""
+@dataclass
+class Game:
+    """Enhanced game data structure"""
+    title: str
+    description: str
+    url: str
+    platform: Platform
+    category: Optional[str] = None
+    rating: Optional[float] = None
+    release_date: Optional[str] = None
+    tags: List[str] = field(default_factory=list)
+    price: Optional[str] = None
+    thumbnail: Optional[str] = None
+    developer: Optional[str] = None
+    is_adult: bool = True
+    last_updated: datetime = field(default_factory=datetime.utcnow)
+
+    def to_dict(self) -> Dict:
+        """Convert to dictionary for serialization"""
+        return {
+            'title': self.title,
+            'description': self.description,
+            'url': self.url,
+            'platform': self.platform.value,
+            'category': self.category,
+            'rating': self.rating,
+            'release_date': self.release_date,
+            'tags': self.tags,
+            'price': self.price,
+            'thumbnail': self.thumbnail,
+            'developer': self.developer,
+            'is_adult': self.is_adult,
+            'last_updated': self.last_updated.isoformat()
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'Game':
+        """Create Game from dictionary"""
+        data = data.copy()
+        if 'platform' in data:
+            data['platform'] = Platform(data['platform'])
+        if 'last_updated' in data:
+            data['last_updated'] = datetime.fromisoformat(data['last_updated'])
+        return cls(**data)
+
+class RateLimiter:
+    """Rate limiter for API calls"""
+    def __init__(self, calls_per_minute: int = 30):
+        self.calls_per_minute = calls_per_minute
+        self.calls = []
+
+    async def acquire(self):
+        now = datetime.utcnow()
+        # Remove calls older than 1 minute
+        self.calls = [call_time for call_time in self.calls 
+                     if now - call_time < timedelta(minutes=1)]
+
+        if len(self.calls) >= self.calls_per_minute:
+            sleep_time = 60 - (now - self.calls[0]).total_seconds()
+            if sleep_time > 0:
+                await asyncio.sleep(sleep_time)
+
+        self.calls.append(now)
+
+class CacheManager:
+    """Advanced caching with Redis support"""
+    def __init__(self, redis_url: Optional[str] = None):
+        self.redis_url = redis_url
+        self.redis = None
+        self.local_cache = {}
+        self.cache_ttl = 3600  # 1 hour
+
+    async def initialize(self):
+        """Initialize Redis connection if available"""
+        if self.redis_url:
+            try:
+                self.redis = await aioredis.from_url(self.redis_url)
+                await self.redis.ping()
+                logger.info("Redis cache initialized")
+            except Exception as e:
+                logger.warning(f"Redis unavailable, using local cache: {e}")
+                self.redis = None
+
+    async def get(self, key: str) -> Optional[Dict]:
+        """Get cached data"""
+        try:
+            if self.redis:
+                data = await self.redis.get(key)
+                if data:
+                    return json.loads(data)
+
+            # Fallback to local cache
+            if key in self.local_cache:
+                cached_data, timestamp = self.local_cache[key]
+                if datetime.utcnow() - timestamp < timedelta(seconds=self.cache_ttl):
+                    return cached_data
+                else:
+                    del self.local_cache[key]
+        except Exception as e:
+            logger.error(f"Cache get error: {e}")
+        return None
+
+    async def set(self, key: str, value: Dict, ttl: Optional[int] = None):
+        """Set cached data"""
+        try:
+            ttl = ttl or self.cache_ttl
+            if self.redis:
+                await self.redis.setex(key, ttl, json.dumps(value))
+
+            # Also store in local cache
+            self.local_cache[key] = (value, datetime.utcnow())
+        except Exception as e:
+            logger.error(f"Cache set error: {e}")
+
+    async def close(self):
+        """Close cache connections"""
+        if self.redis:
+            await self.redis.close()
+
+class GameSearchAPI:
+    """Base class for game search APIs"""
+    def __init__(self, api_key: Optional[str] = None, rate_limiter: Optional[RateLimiter] = None):
+        self.api_key = api_key
+        self.rate_limiter = rate_limiter or RateLimiter()
+        self.session: Optional[aiohttp.ClientSession] = None
+
+    async def get_session(self) -> aiohttp.ClientSession:
+        """Get or create aiohttp session"""
+        if not self.session or self.session.closed:
+            timeout = aiohttp.ClientTimeout(total=30)
+            connector = aiohttp.TCPConnector(limit=100, limit_per_host=30)
+            self.session = aiohttp.ClientSession(
+                timeout=timeout,
+                connector=connector,
+                headers={'User-Agent': 'NSFWGameBot/2.0'}
+            )
+        return self.session
+
+    async def close(self):
+        """Close session"""
+        if self.session and not self.session.closed:
+            await self.session.close()
+
+    async def search(self, query: str, limit: int = 10) -> List[Game]:
+        """Override in subclasses"""
+        raise NotImplementedError
+
+class RedditAPI(GameSearchAPI):
+    """Enhanced Reddit API integration"""
+    def __init__(self, client_id: str, client_secret: str, user_agent: str):
+        super().__init__(rate_limiter=RateLimiter(calls_per_minute=60))
+        self.reddit = praw.Reddit(
+            client_id=client_id,
+            client_secret=client_secret,
+            user_agent=user_agent,
+            check_for_async=False
+        )
+
+    async def search(self, query: str, limit: int = 10) -> List[Game]:
+        """Search Reddit for NSFW games"""
+        games = []
+        try:
+            await self.rate_limiter.acquire()
+
+            subreddits = ['NSFWgaming', 'lewdgames', 'AdultGamers', 'eroge']
+
+            for subreddit_name in subreddits:
+                try:
+                    subreddit = self.reddit.subreddit(subreddit_name)
+                    for submission in subreddit.search(query, limit=max(1, limit // len(subreddits))):
+                        if not submission.over_18:
+                            continue
+
+                        game = Game(
+                            title=submission.title[:100],
+                            description=self._clean_description(submission.selftext),
+                            url=submission.url,
+                            platform=Platform.REDDIT,
+                            rating=submission.score / 100.0 if submission.score > 0 else None,
+                            tags=[flair.display_text for flair in getattr(submission, 'link_flair_richtext', [])],
+                            last_updated=datetime.fromtimestamp(submission.created_utc)
+                        )
+                        games.append(game)
+
+                        if len(games) >= limit:
+                            break
+                except Exception as e:
+                    logger.error(f"Error searching subreddit {subreddit_name}: {e}")
+                    continue
+
+        except Exception as e:
+            logger.error(f"Reddit API error: {e}")
+
+        return games[:limit]
+
+    def _clean_description(self, text: str) -> str:
+        """Clean and truncate description"""
+        if not text:
+            return "No description available"
+        # Remove markdown and limit length
+        cleaned = text.replace('**', '').replace('*', '').replace('\n\n', '\n')
+        return cleaned[:300] + '...' if len(cleaned) > 300 else cleaned
+
+class ItchIOAPI(GameSearchAPI):
+    """Enhanced Itch.io API integration"""
+    def __init__(self, api_key: Optional[str] = None):
+        super().__init__(api_key, RateLimiter(calls_per_minute=120))
+        self.base_url = "https://itch.io/api/1/"
+
+    async def search(self, query: str, limit: int = 10) -> List[Game]:
+        """Search Itch.io for games"""
+        games = []
+        try:
+            await self.rate_limiter.acquire()
+            session = await self.get_session()
+
+            # Use both search and browse endpoints
+            endpoints = [
+                f"search/games?q={quote_plus(query)}&nsfw=true",
+                f"games?nsfw=true&tag={quote_plus(query)}"
+            ]
+
+            for endpoint in endpoints:
+                try:
+                    url = urljoin(self.base_url, endpoint)
+                    if self.api_key:
+                        url += f"&api_key={self.api_key}"
+
+                    async with session.get(url) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            for game_data in data.get('games', [])[:limit]:
+                                game = Game(
+                                    title=game_data.get('title', 'Unknown'),
+                                    description=game_data.get('short_text', 'No description'),
+                                    url=game_data.get('url', ''),
+                                    platform=Platform.ITCH_IO,
+                                    category=game_data.get('classification', ''),
+                                    rating=game_data.get('rating', 0) / 5.0 if game_data.get('rating') else None,
+                                    price=game_data.get('price', 'Free'),
+                                    thumbnail=game_data.get('cover_url'),
+                                    developer=game_data.get('user', {}).get('display_name'),
+                                    tags=game_data.get('tags', [])
+                                )
+                                games.append(game)
+
+                except Exception as e:
+                    logger.error(f"Error with Itch.io endpoint {endpoint}: {e}")
+                    continue
+
+        except Exception as e:
+            logger.error(f"Itch.io API error: {e}")
+
+        return games[:limit]
+
+class VNDBAPI(GameSearchAPI):
+    """VNDB API integration"""
+    def __init__(self):
+        super().__init__(rate_limiter=RateLimiter(calls_per_minute=100))
+        self.base_url = "https://api.vndb.org/kana/"
+
+    async def search(self, query: str, limit: int = 10) -> List[Game]:
+        """Search VNDB for visual novels"""
+        games = []
+        try:
+            await self.rate_limiter.acquire()
+            session = await self.get_session()
+
+            search_data = {
+                "filters": ["search", "=", query],
+                "fields": "title,description,image.url,length,rating,released,tags.name,developers.name",
+                "results": limit
+            }
+
+            async with session.post(
+                f"{self.base_url}vn",
+                json=search_data,
+                headers={"Content-Type": "application/json"}
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    for vn in data.get('results', []):
+                        game = Game(
+                            title=vn.get('title', 'Unknown VN'),
+                            description=vn.get('description', 'No description')[:300],
+                            url=f"https://vndb.org/v{vn.get('id')}",
+                            platform=Platform.VNDB,
+                            category="Visual Novel",
+                            rating=vn.get('rating', 0) / 10.0 if vn.get('rating') else None,
+                            release_date=vn.get('released'),
+                            thumbnail=vn.get('image', {}).get('url'),
+                            developer=', '.join([dev.get('name', '') for dev in vn.get('developers', [])]),
+                            tags=[tag.get('name', '') for tag in vn.get('tags', [])]
+                        )
+                        games.append(game)
+
+        except Exception as e:
+            logger.error(f"VNDB API error: {e}")
+
+        return games
+
+class NSFWGameCog(commands.Cog):
+    """Enhanced NSFW Game Cog with robust error handling and caching"""
 
     def __init__(self, bot):
         self.bot = bot
-        self.session = None
-        self.itch_key = os.getenv("ITCH_API_KEY")
-        self.cache = {}  # Simple caching system
-        self.cache_timeout = 300  # 5 minutes
+        self.cache = CacheManager(os.getenv("REDIS_URL"))
 
-        # Creative game categories and emojis
-        self.game_categories = {
-            "visual_novel": {"emoji": "📖", "tags": ["visual-novel", "story-rich"]},
-            "action": {"emoji": "⚔️", "tags": ["action", "combat"]},
-            "puzzle": {"emoji": "🧩", "tags": ["puzzle", "strategy"]},
-            "simulation": {"emoji": "🏠", "tags": ["simulation", "life-sim"]},
-            "rpg": {"emoji": "🗡️", "tags": ["rpg", "adventure"]},
-            "horror": {"emoji": "👻", "tags": ["horror", "thriller"]},
-            "romance": {"emoji": "💕", "tags": ["romance", "dating"]},
-            "fantasy": {"emoji": "🧙", "tags": ["fantasy", "magic"]}
+        # Initialize APIs
+        self.apis = {}
+        self._init_apis()
+
+        # Game categories with weighted selection
+        self.categories = {
+            "Visual Novel": 3,
+            "RPG": 2,
+            "Adventure": 2,
+            "Dating Sim": 3,
+            "Puzzle": 1,
+            "Shooter": 1,
+            "Fantasy": 2,
+            "Romance": 3,
+            "Simulation": 2
         }
 
-        # Fun loading messages
-        self.loading_messages = [
-            "🔍 Searching the depths of the internet...",
-            "🎮 Discovering hidden gems...",
-            "🔥 Finding spicy content...",
-            "✨ Conjuring magical experiences...",
-            "🚀 Launching into adult gaming space...",
-            "🎯 Targeting your interests...",
-            "💎 Mining for quality content...",
-            "🌟 Curating exceptional experiences..."
-        ]
+        # Statistics tracking
+        self.stats = {
+            'searches': 0,
+            'games_found': 0,
+            'cache_hits': 0,
+            'api_errors': 0
+        }
+
+    def _init_apis(self):
+        """Initialize all API clients"""
+        try:
+            # Reddit API
+            if all(os.getenv(key) for key in ["REDDIT_CLIENT_ID", "REDDIT_SECRET"]):
+                self.apis[Platform.REDDIT] = RedditAPI(
+                    client_id=os.getenv("REDDIT_CLIENT_ID"),
+                    client_secret=os.getenv("REDDIT_SECRET"),
+                    user_agent=os.getenv("USER_AGENT", "NSFWGameBot/2.0")
+                )
+                logger.info("Reddit API initialized")
+
+            # Itch.io API
+            self.apis[Platform.ITCH_IO] = ItchIOAPI(os.getenv("ITCH_API"))
+            logger.info("Itch.io API initialized")
+
+            # VNDB API
+            self.apis[Platform.VNDB] = VNDBAPI()
+            logger.info("VNDB API initialized")
+
+        except Exception as e:
+            logger.error(f"API initialization error: {e}")
 
     async def cog_load(self):
-        """Initialize aiohttp session when cog loads"""
-        self.session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=15),
-            headers={'User-Agent': 'NSFWGames Discord Bot 1.0'}
-        )
-        logger.info("NSFWGames cog loaded successfully! 🎮")
+        """Initialize cog resources"""
+        await self.cache.initialize()
+        logger.info("NSFWGameCog loaded successfully")
 
     async def cog_unload(self):
-        """Clean up session when cog unloads"""
-        if self.session:
-            await self.session.close()
-        logger.info("NSFWGames cog unloaded. Session closed.")
+        """Cleanup resources"""
+        await self.cache.close()
+        for api in self.apis.values():
+            await api.close()
+        logger.info("NSFWGameCog unloaded")
 
-    def _is_cache_valid(self, cache_key: str) -> bool:
-        """Check if cache entry is still valid"""
-        if cache_key not in self.cache:
-            return False
-        return (datetime.now() - self.cache[cache_key]['timestamp']).seconds < self.cache_timeout
+    def _create_cache_key(self, query: str, search_type: str) -> str:
+        """Create cache key for queries"""
+        return f"nsfwgame:{search_type}:{hashlib.md5(query.encode()).hexdigest()}"
 
-    def _get_from_cache(self, cache_key: str) -> Optional[List[GameResult]]:
-        """Get data from cache if valid"""
-        if self._is_cache_valid(cache_key):
-            return self.cache[cache_key]['data']
-        return None
+    async def _search_with_fallback(self, query: str, limit: int = 10) -> List[Game]:
+        """Search with API fallback and error handling"""
+        cache_key = self._create_cache_key(query, "search")
 
-    def _store_in_cache(self, cache_key: str, data: List[GameResult]):
-        """Store data in cache"""
-        self.cache[cache_key] = {
-            'data': data,
-            'timestamp': datetime.now()
-        }
+        # Check cache first
+        cached_results = await self.cache.get(cache_key)
+        if cached_results:
+            self.stats['cache_hits'] += 1
+            return [Game.from_dict(game_data) for game_data in cached_results]
 
-    async def _safe_fetch(self, url: str, return_json: bool = True, headers: Dict = None) -> Optional[any]:
-        """Enhanced fetch with better error handling and retries"""
-        if not self.session:
-            await self.cog_load()
+        all_games = []
+        errors = []
 
-        for attempt in range(3):
+        # Try all available APIs
+        for platform, api in self.apis.items():
             try:
-                async with self.session.get(url, headers=headers) as resp:
-                    if resp.status == 200:
-                        return await resp.json() if return_json else await resp.text()
-                    elif resp.status == 429:  # Rate limited
-                        wait_time = 2 ** attempt
-                        logger.warning(f"Rate limited. Waiting {wait_time}s before retry...")
-                        await asyncio.sleep(wait_time)
-                    else:
-                        logger.warning(f"HTTP {resp.status} for {url}")
-
-            except asyncio.TimeoutError:
-                logger.warning(f"Timeout on {url} (attempt {attempt + 1}/3)")
-                await asyncio.sleep(1)
+                games = await api.search(query, max(1, limit // len(self.apis)))
+                all_games.extend(games)
+                logger.debug(f"{platform.value} returned {len(games)} games")
             except Exception as e:
-                logger.error(f"Error fetching {url}: {e}")
-                if attempt == 2:  # Last attempt
-                    return None
-                await asyncio.sleep(1)
+                error_msg = f"{platform.value} API error: {str(e)}"
+                errors.append(error_msg)
+                logger.error(error_msg)
+                self.stats['api_errors'] += 1
 
-        return None
+        # Sort by rating and relevance
+        all_games.sort(key=lambda g: (
+            g.rating or 0,
+            len([tag for tag in g.tags if query.lower() in tag.lower()]),
+            query.lower() in g.title.lower()
+        ), reverse=True)
 
-    async def _fetch_itch_games(self, tags: List[str], page: int = 1) -> List[GameResult]:
-        """Fetch games from Itch.io with enhanced data"""
-        cache_key = f"itch_{','.join(tags)}_{page}"
-        cached = self._get_from_cache(cache_key)
-        if cached:
-            return cached
+        result_games = all_games[:limit]
 
-        if not self.itch_key:
-            logger.warning("No Itch.io API key found. Using fallback method.")
-            return await self._fetch_itch_fallback(tags, page)
-
-        url = f"https://itch.io/api/1/{self.itch_key}/search/games"
-        params = {
-            'tags': ','.join(tags),
-            'page': page,
-            'format': 'json'
-        }
-
-        # Build URL with parameters
-        param_str = '&'.join([f"{k}={v}" for k, v in params.items()])
-        full_url = f"{url}?{param_str}"
-
-        data = await self._safe_fetch(full_url)
-        if not data or 'games' not in data:
-            return []
-
-        games = []
-        for game_data in data.get('games', [])[:10]:  # Limit to 10 results
-            game = GameResult(
-                title=game_data.get('title', 'Unknown Title'),
-                url=game_data.get('url', ''),
-                description=self._clean_description(game_data.get('short_text', 'No description available.')),
-                rating=f"⭐ {game_data.get('rating', 'N/A')}",
-                price=game_data.get('price_text', 'Free'),
-                tags=game_data.get('tags', []),
-                image_url=game_data.get('cover_url')
+        # Cache results
+        if result_games:
+            await self.cache.set(
+                cache_key, 
+                [game.to_dict() for game in result_games],
+                ttl=1800  # 30 minutes
             )
-            games.append(game)
 
-        self._store_in_cache(cache_key, games)
-        return games
+        self.stats['searches'] += 1
+        self.stats['games_found'] += len(result_games)
 
-    async def _fetch_itch_fallback(self, tags: List[str], page: int = 1) -> List[GameResult]:
-        """Fallback method for Itch.io when API key is not available"""
-        tag_str = '+'.join(tags)
-        url = f"https://itch.io/games/tag-{tag_str}?format=json&page={page}"
+        return result_games
 
-        html = await self._safe_fetch(url, return_json=False)
-        if not html:
-            return []
-
-        # Parse HTML for game links (simplified approach)
-        game_pattern = r'<a[^>]+href="([^"]+)"[^>]*class="[^"]*game_link[^"]*"[^>]*>([^<]+)</a>'
-        matches = re.findall(game_pattern, html, re.IGNORECASE)
-
-        games = []
-        for url, title in matches[:8]:  # Limit results
-            if url.startswith('/'):
-                url = f"https://itch.io{url}"
-
-            game = GameResult(
-                title=title.strip(),
-                url=url,
-                description="Adult game from Itch.io",
-                rating="N/A",
-                price="Varies"
-            )
-            games.append(game)
-
-        return games
-
-    async def _fetch_f95_games(self, tag: str = None, page: int = 1) -> List[GameResult]:
-        """Enhanced F95Zone scraping with better parsing"""
-        cache_key = f"f95_{tag}_{page}"
-        cached = self._get_from_cache(cache_key)
-        if cached:
-            return cached
-
-        base_url = "https://f95zone.to/latest/"
-        if tag:
-            base_url += f"?tags={tag}"
-
-        html = await self._safe_fetch(base_url, return_json=False)
-        if not html:
-            return []
-
-        # Enhanced regex for better game extraction
-        pattern = r'<a href="(/threads/[^"]+)"[^>]*>(?:<[^>]*>)*([^<]+?)(?:\s*\[[^\]]+\])?</a>'
-        matches = re.findall(pattern, html, re.DOTALL)
-
-        games = []
-        start_idx = (page - 1) * 6
-        end_idx = start_idx + 6
-
-        for link, title in matches[start_idx:end_idx]:
-            clean_title = re.sub(r'\s+', ' ', title).strip()
-            if len(clean_title) < 3:  # Skip very short titles
-                continue
-
-            game = GameResult(
-                title=clean_title,
-                url=f"https://f95zone.to{link}",
-                description="🔞 Adult game discussion from F95Zone community",
-                rating="Community Rated",
-                price="Varies",
-                tags=["adult", "community"]
-            )
-            games.append(game)
-
-        self._store_in_cache(cache_key, games)
-        return games
-
-    async def _fetch_dlsite_games(self, category: str = None, page: int = 1) -> List[GameResult]:
-        """Enhanced DLSite integration with better data"""
-        cache_key = f"dlsite_{category}_{page}"
-        cached = self._get_from_cache(cache_key)
-        if cached:
-            return cached
-
-        # Mock data for demonstration (replace with actual DLSite API if available)
-        mock_games = [
-            GameResult(
-                title="Fantasy Adventure RPG",
-                url="https://www.dlsite.com/maniax/work/=/product_id/RJ123456.html",
-                description="🏰 Epic fantasy adventure with mature themes",
-                rating="⭐ 4.5/5",
-                price="¥1,200",
-                tags=["rpg", "fantasy", "adult"]
-            ),
-            GameResult(
-                title="Visual Novel Romance",
-                url="https://www.dlsite.com/maniax/work/=/product_id/RJ789012.html",
-                description="💕 Romantic story with multiple endings",
-                rating="⭐ 4.2/5",
-                price="¥800",
-                tags=["visual-novel", "romance"]
-            ),
-            GameResult(
-                title="Action Platformer",
-                url="https://www.dlsite.com/maniax/work/=/product_id/RJ345678.html",
-                description="⚔️ Fast-paced action with adult content",
-                rating="⭐ 4.0/5",
-                price="¥1,500",
-                tags=["action", "platformer"]
-            )
-        ]
-
-        # Simulate pagination
-        start_idx = (page - 1) * 3
-        end_idx = start_idx + 3
-        games = mock_games[start_idx:end_idx] if start_idx < len(mock_games) else []
-
-        self._store_in_cache(cache_key, games)
-        return games
-
-    def _clean_description(self, description: str) -> str:
-        """Clean and enhance game descriptions"""
-        if not description or description.lower() in ['no description', 'no description.', '']:
-            return "🎮 Exciting adult gaming experience awaits!"
-
-        # Remove HTML tags
-        clean_desc = re.sub(r'<[^>]+>', '', description)
-
-        # Limit length and add emoji
-        if len(clean_desc) > 100:
-            clean_desc = clean_desc[:97] + "..."
-
-        return f"🎯 {clean_desc}"
-
-    def _create_game_embed(self, game: GameResult, site: str) -> discord.Embed:
-        """Create enhanced embed for game display"""
-        # Choose color based on site
-        colors = {
-            'itch': discord.Color.orange(),
-            'f95': discord.Color.purple(),
-            'dlsite': discord.Color.blue()
-        }
-
+    def _create_game_embed(self, game: Game, title_prefix: str = "") -> discord.Embed:
+        """Create enhanced embed for a game"""
         embed = discord.Embed(
-            title=f"🎮 {game.title}",
-            url=game.url,
-            description=game.description,
-            color=colors.get(site, discord.Color.red()),
-            timestamp=datetime.now()
+            title=f"{title_prefix}{game.title}",
+            description=game.description[:2048],  # Discord limit
+            color=self._get_platform_color(game.platform),
+            url=game.url
         )
 
-        # Add fields with enhanced information
-        embed.add_field(name="💰 Price", value=game.price, inline=True)
-        embed.add_field(name="📊 Rating", value=game.rating, inline=True)
-        embed.add_field(name="🏷️ Source", value=site.upper(), inline=True)
+        embed.add_field(name="🎮 Platform", value=game.platform.value, inline=True)
+
+        if game.category:
+            embed.add_field(name="📂 Category", value=game.category, inline=True)
+
+        if game.rating:
+            stars = "⭐" * min(5, int(game.rating * 5))
+            embed.add_field(name="⭐ Rating", value=f"{stars} ({game.rating:.1f})", inline=True)
+
+        if game.developer:
+            embed.add_field(name="👥 Developer", value=game.developer, inline=True)
+
+        if game.price:
+            embed.add_field(name="💰 Price", value=game.price, inline=True)
+
+        if game.release_date:
+            embed.add_field(name="📅 Released", value=game.release_date, inline=True)
 
         if game.tags:
-            tags_str = " • ".join([f"`{tag}`" for tag in game.tags[:5]])
-            embed.add_field(name="🔖 Tags", value=tags_str, inline=False)
+            tags_str = ", ".join(game.tags[:5])  # Limit to 5 tags
+            if len(game.tags) > 5:
+                tags_str += f" (+{len(game.tags) - 5} more)"
+            embed.add_field(name="🏷️ Tags", value=tags_str, inline=False)
 
-        # Add thumbnail if available
-        if game.image_url:
-            embed.set_thumbnail(url=game.image_url)
+        if game.thumbnail:
+            embed.set_thumbnail(url=game.thumbnail)
 
-        # Add footer with helpful info
-        embed.set_footer(
-            text=f"🔞 NSFW Content • Use reactions to get more games",
-            icon_url=self.bot.user.avatar.url if self.bot.user.avatar else None
-        )
+        embed.set_footer(text=f"🔞 Adult Content • Last updated: {game.last_updated.strftime('%Y-%m-%d')}")
 
         return embed
 
-    # ===================
-    # SLASH COMMANDS
-    # ===================
+    def _get_platform_color(self, platform: Platform) -> discord.Color:
+        """Get color based on platform"""
+        color_map = {
+            Platform.REDDIT: discord.Color.orange(),
+            Platform.ITCH_IO: discord.Color.from_rgb(250, 92, 92),
+            Platform.STEAM: discord.Color.from_rgb(23, 26, 33),
+            Platform.VNDB: discord.Color.purple(),
+            Platform.NUTAKU: discord.Color.gold(),
+            Platform.DLSITE: discord.Color.blue()
+        }
+        return color_map.get(platform, discord.Color.red())
 
-    @app_commands.command(name="game", description="🎮 Get a random NSFW game from various sites")
-    @app_commands.describe(
-        site="Choose the gaming site to search",
-        tag="Optional: Filter by game tag/category"
-    )
-    @app_commands.choices(site=[
-        app_commands.Choice(name="🍃 Itch.io", value="itch"),
-        app_commands.Choice(name="🟣 F95Zone", value="f95"),
-        app_commands.Choice(name="🟦 DLSite", value="dlsite")
-    ])
-    async def slash_game(self, interaction: discord.Interaction, 
-                        site: app_commands.Choice[str], 
-                        tag: str = None):
-        """Slash command for getting a single random game"""
-        await interaction.response.defer()
+    async def _get_weighted_random_category(self) -> str:
+        """Get weighted random category"""
+        categories = list(self.categories.keys())
+        weights = list(self.categories.values())
+        return random.choices(categories, weights=weights)[0]
 
-        # Check NSFW channel
-        if not interaction.channel.is_nsfw():
-            embed = discord.Embed(
-                title="🚫 NSFW Channel Required",
-                description="This command only works in NSFW channels for safety!",
-                color=discord.Color.red()
-            )
-            return await interaction.followup.send(embed=embed, ephemeral=True)
+    # ============= COMMANDS =============
 
-        await self._handle_slash_game_request(interaction, site.value, tag, single=True)
-
-    @app_commands.command(name="gamelist", description="📋 List NSFW games with pagination")
-    @app_commands.describe(
-        site="Choose the gaming site to search",
-        page="Page number (default: 1)",
-        tag="Optional: Filter by game tag/category"
-    )
-    @app_commands.choices(site=[
-        app_commands.Choice(name="🍃 Itch.io", value="itch"),
-        app_commands.Choice(name="🟣 F95Zone", value="f95"),
-        app_commands.Choice(name="🟦 DLSite", value="dlsite")
-    ])
-    async def slash_gamelist(self, interaction: discord.Interaction, 
-                           site: app_commands.Choice[str], 
-                           page: int = 1,
-                           tag: str = None):
-        """Slash command for getting a list of games"""
-        await interaction.response.defer()
-
-        # Check NSFW channel
-        if not interaction.channel.is_nsfw():
-            embed = discord.Embed(
-                title="🚫 NSFW Channel Required",
-                description="This command only works in NSFW channels for safety!",
-                color=discord.Color.red()
-            )
-            return await interaction.followup.send(embed=embed, ephemeral=True)
-
-        if page < 1:
-            page = 1
-
-        await self._handle_slash_game_request(interaction, site.value, tag, single=False, page=page)
-
-    @app_commands.command(name="categories", description="🏷️ Show available game categories and tags")
-    async def slash_categories(self, interaction: discord.Interaction):
-        """Slash command to show game categories"""
+    @commands.command(name="gamehelp")
+    async def gamehelp(self, ctx):
+        """Enhanced help command"""
         embed = discord.Embed(
-            title="🎮 Game Categories & Tags",
-            description="Choose from these exciting categories!",
+            title="🎮 NSFW Game Bot - Help",
+            description="Advanced NSFW game discovery bot with multiple platform support",
             color=discord.Color.blurple()
         )
 
-        for category, info in self.game_categories.items():
-            tags = " • ".join([f"`{tag}`" for tag in info["tags"]])
-            embed.add_field(
-                name=f"{info['emoji']} {category.replace('_', ' ').title()}",
-                value=tags,
-                inline=True
-            )
-
-        embed.set_footer(text="Use these tags with /game or /gamelist commands")
-        await interaction.response.send_message(embed=embed)
-
-    @app_commands.command(name="gamehelp", description="📖 Show detailed help for NSFW games commands")
-    async def slash_game_help(self, interaction: discord.Interaction):
-        """Slash command for detailed help"""
-        embed = discord.Embed(
-            title="🎮 NSFW Games Bot - Complete Guide",
-            description="Your gateway to adult gaming discoveries!",
-            color=discord.Color.gold()
-        )
-
         embed.add_field(
-            name="🎯 Slash Commands",
-            value=(
-                "`/game [site] [tag]` - Get random game\n"
-                "`/gamelist [site] [page] [tag]` - List games\n"
-                "`/gamehelp` - Show this help\n"
-                "`/categories` - Show game categories"
-            ),
+            name="🎲 Random Game",
+            value="`n!nsfwgame [category]` - Get a random NSFW game, optionally from a specific category",
             inline=False
         )
 
         embed.add_field(
-            name="🎯 Text Commands",
-            value=(
-                "`!nsfwgame [site] [tag]` - Get random game\n"
-                "`!nsfwlist [site] [page] [tag]` - List games\n"
-                "`!gamehelp` - Show this help\n"
-                "`!categories` - Show game categories"
-            ),
+            name="🔍 Search Games",
+            value="`n!nsfwlist <query>` - Search games across all platforms",
             inline=False
         )
 
         embed.add_field(
-            name="🌐 Supported Sites",
-            value=(
-                "**itch** - Itch.io indie games\n"
-                "**f95** - F95Zone community\n"
-                "**dlsite** - Japanese adult content"
-            ),
+            name="📂 Categories",
+            value="`n!categories` - Show available game categories",
             inline=False
         )
 
         embed.add_field(
-            name="🏷️ Popular Tags",
-            value="`visual-novel`, `rpg`, `action`, `puzzle`, `romance`, `fantasy`, `horror`",
+            name="📊 Statistics",
+            value="`n!gamestats` - Show bot usage statistics",
             inline=False
         )
 
         embed.add_field(
-            name="⚠️ Important Notes",
-            value=(
-                "• Only works in NSFW channels\n"
-                "• Content is 18+ only\n"
-                "• Respect community guidelines\n"
-                "• Use responsibly"
-            ),
+            name="🎮 Supported Platforms",
+            value="Reddit, Itch.io, VNDB, Steam, Nutaku, DLsite",
             inline=False
         )
 
-        embed.set_footer(text="Made with ❤️ for adult gaming enthusiasts")
-        await interaction.response.send_message(embed=embed)
+        embed.set_footer(text="🔞 All content is adult-oriented • Use responsibly")
 
-    # Tag autocomplete for slash commands
-    @slash_game.autocomplete('tag')
-    @slash_gamelist.autocomplete('tag')
-    async def tag_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
-        """Provide autocomplete suggestions for tags"""
-        # Common tags to suggest
-        common_tags = [
-            "visual-novel", "rpg", "action", "puzzle", "simulation", 
-            "romance", "fantasy", "horror", "adventure", "strategy",
-            "platformer", "indie", "2d", "3d", "anime"
-        ]
-
-        # Add category names
-        category_names = list(self.game_categories.keys())
-        all_suggestions = common_tags + category_names
-
-        # Filter suggestions based on current input
-        if current:
-            filtered = [tag for tag in all_suggestions if current.lower() in tag.lower()]
-        else:
-            filtered = all_suggestions[:25]  # Discord limit
-
-        return [
-            app_commands.Choice(name=f"🏷️ {tag}", value=tag) 
-            for tag in filtered[:25]
-        ]
-
-    # ===================
-    # TEXT COMMANDS (Existing)
-    # ===================
-
-    @commands.command(name="nsfwgame", aliases=["adultgame", "game18"])
-    async def nsfwgame_command(self, ctx, site: str = "itch", *, tag: str = None):
-        """🎮 Get a random NSFW game from various sites!
-
-        Usage: !nsfwgame [site] [tag]
-        Sites: itch, f95, dlsite
-        Tags: visual-novel, rpg, action, etc.
-        """
-        await self._handle_game_request(ctx, site, tag, single=True)
-
-    @commands.command(name="nsfwlist", aliases=["gamelist", "adultlist"])
-    async def nsfwlist_command(self, ctx, site: str = "itch", page: int = 1, *, tag: str = None):
-        """📋 List NSFW games with pagination!
-
-        Usage: !nsfwlist [site] [page] [tag]
-        Sites: itch, f95, dlsite
-        Page: 1, 2, 3, etc.
-        """
-        await self._handle_game_request(ctx, site, tag, single=False, page=page)
-
-    @commands.command(name="gamehelp", aliases=["adulthelp"])
-    async def game_help(self, ctx):
-        """📖 Show detailed help for NSFW games commands"""
-        embed = discord.Embed(
-            title="🎮 NSFW Games Bot - Complete Guide",
-            description="Your gateway to adult gaming discoveries!",
-            color=discord.Color.gold()
-        )
-
-        embed.add_field(
-            name="🎯 Slash Commands",
-            value=(
-                "`/game [site] [tag]` - Get random game\n"
-                "`/gamelist [site] [page] [tag]` - List games\n"
-                "`/gamehelp` - Show this help\n"
-                "`/categories` - Show game categories"
-            ),
-            inline=False
-        )
-
-        embed.add_field(
-            name="🎯 Text Commands",
-            value=(
-                "`!nsfwgame [site] [tag]` - Get random game\n"
-                "`!nsfwlist [site] [page] [tag]` - List games\n"
-                "`!gamehelp` - Show this help\n"
-                "`!categories` - Show game categories"
-            ),
-            inline=False
-        )
-
-        embed.add_field(
-            name="🌐 Supported Sites",
-            value=(
-                "**itch** - Itch.io indie games\n"
-                "**f95** - F95Zone community\n"
-                "**dlsite** - Japanese adult content"
-            ),
-            inline=False
-        )
-
-        embed.add_field(
-            name="🏷️ Popular Tags",
-            value="`visual-novel`, `rpg`, `action`, `puzzle`, `romance`, `fantasy`, `horror`",
-            inline=False
-        )
-
-        embed.add_field(
-            name="⚠️ Important Notes",
-            value=(
-                "• Only works in NSFW channels\n"
-                "• Content is 18+ only\n"
-                "• Respect community guidelines\n"
-                "• Use responsibly"
-            ),
-            inline=False
-        )
-
-        embed.set_footer(text="Made with ❤️ for adult gaming enthusiasts")
         await ctx.send(embed=embed)
 
-    @commands.command(name="categories")
-    async def show_categories(self, ctx):
-        """🏷️ Show available game categories with emojis"""
+    # ============= SLASH COMMANDS =============
+
+    @app_commands.command(name="gamehelp", description="Show comprehensive help for NSFW game commands")
+    async def gamehelp_slash(self, interaction: discord.Interaction):
+        """Enhanced help command with slash command support"""
         embed = discord.Embed(
-            title="🎮 Game Categories & Tags",
-            description="Choose from these exciting categories!",
+            title="🎮 NSFW Game Bot - Help",
+            description="Advanced NSFW game discovery bot with multiple platform support",
             color=discord.Color.blurple()
         )
 
-        for category, info in self.game_categories.items():
-            tags = " • ".join([f"`{tag}`" for tag in info["tags"]])
-            embed.add_field(
-                name=f"{info['emoji']} {category.replace('_', ' ').title()}",
-                value=tags,
-                inline=True
-            )
-
-        embed.set_footer(text="Use these tags with !nsfwgame or !nsfwlist commands")
-        await ctx.send(embed=embed)
-
-    # ===================
-    # SHARED HANDLERS
-    # ===================
-
-    async def _handle_slash_game_request(self, interaction: discord.Interaction, site: str, tag: str, single: bool = True, page: int = 1):
-        """Enhanced unified handler for slash command game requests"""
-        # Validate site
-        site = site.lower()
-        valid_sites = ["itch", "f95", "dlsite"]
-        if site not in valid_sites:
-            embed = discord.Embed(
-                title="❌ Invalid Site",
-                description=f"Please choose from: `{', '.join(valid_sites)}`",
-                color=discord.Color.red()
-            )
-            return await interaction.followup.send(embed=embed, ephemeral=True)
-
-        # Show loading message
-        loading_msg = random.choice(self.loading_messages)
-        embed = discord.Embed(
-            title="🔄 Searching...",
-            description=loading_msg,
-            color=discord.Color.blue()
+        embed.add_field(
+            name="🎲 Random Game",
+            value="</nsfwgame:0> - Get a random NSFW game with optional category filter",
+            inline=False
         )
-        await interaction.followup.send(embed=embed)
+
+        embed.add_field(
+            name="🔍 Search Games",
+            value="</nsfwlist:0> - Search games across all platforms",
+            inline=False
+        )
+
+        embed.add_field(
+            name="🎯 Advanced Search",
+            value="</gamesearch:0> - Advanced search with filters (platform, rating, etc.)",
+            inline=False
+        )
+
+        embed.add_field(
+            name="📂 Categories",
+            value="</categories:0> - Show available game categories",
+            inline=False
+        )
+
+        embed.add_field(
+            name="📊 Statistics",
+            value="</gamestats:0> - Show bot usage statistics",
+            inline=False
+        )
+
+        embed.add_field(
+            name="⚙️ Preferences",
+            value="</gameprefs:0> - Set your game preferences",
+            inline=False
+        )
+
+        embed.add_field(
+            name="🎮 Supported Platforms",
+            value="Reddit, Itch.io, VNDB, Steam, Nutaku, DLsite",
+            inline=False
+        )
+
+        embed.set_footer(text="🔞 All content is adult-oriented • Use responsibly")
+        await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(name="nsfwgame", description="Get a random NSFW game")
+    @app_commands.describe(
+        category="Game category (optional - leave blank for random)",
+        platform="Specific platform to search (optional)"
+    )
+    async def nsfwgame_slash(
+        self, 
+        interaction: discord.Interaction, 
+        category: str = None,
+        platform: str = None
+    ):
+        """Get random NSFW game with enhanced options"""
+        await interaction.response.defer(thinking=True)
 
         try:
-            # Fetch games based on site
-            games = []
-            if site == "itch":
-                tags = ["adult"]
-                if tag:
-                    # Check if tag matches a category
-                    if tag.lower() in self.game_categories:
-                        tags.extend(self.game_categories[tag.lower()]["tags"])
-                    else:
-                        tags.append(tag.lower())
-                games = await self._fetch_itch_games(tags, page)
+            if not category:
+                category = await self._get_weighted_random_category()
 
-            elif site == "f95":
-                games = await self._fetch_f95_games(tag, page)
-
-            elif site == "dlsite":
-                games = await self._fetch_dlsite_games(tag, page)
+            # Filter by platform if specified
+            if platform and platform.upper() in [p.name for p in Platform]:
+                target_platform = Platform[platform.upper()]
+                if target_platform in self.apis:
+                    games = await self.apis[target_platform].search(category, limit=20)
+                else:
+                    await interaction.followup.send(f"❌ Platform '{platform}' is not available.")
+                    return
+            else:
+                games = await self._search_with_fallback(category, limit=20)
 
             if not games:
                 embed = discord.Embed(
-                    title="😔 No Results Found",
-                    description=f"No games found on {site.upper()} with your criteria.\nTry different tags or check back later!",
-                    color=discord.Color.orange()
+                    title="❌ No Games Found",
+                    description=f"No games found for category '{category}'. Try a different category!",
+                    color=discord.Color.red()
                 )
-                embed.set_footer(text="Tip: Use /categories to see available tags")
-                return await interaction.edit_original_response(embed=embed)
+                await interaction.followup.send(embed=embed)
+                return
 
-            if single:
-                # Send single random game
-                game = random.choice(games)
-                embed = self._create_game_embed(game, site)
-                await interaction.edit_original_response(embed=embed)
-
-            else:
-                # Send list of games
-                embed = discord.Embed(
-                    title=f"🎮 {site.upper()} Games (Page {page})",
-                    description=f"Found {len(games)} games" + (f" with tag: `{tag}`" if tag else ""),
-                    color=discord.Color.purple()
-                )
-
-                for i, game in enumerate(games, 1):
-                    embed.add_field(
-                        name=f"{i}. {game.title}",
-                        value=f"[🔗 Play Now]({game.url})\n{game.description[:50]}...",
-                        inline=False
-                    )
-
-                embed.set_footer(text=f"Page {page} • Use /gamelist {site} {page + 1} for next page")
-                await interaction.edit_original_response(embed=embed)
+            game = random.choice(games)
+            embed = self._create_game_embed(game, "🎲 Random Game: ")
+            await interaction.followup.send(embed=embed)
 
         except Exception as e:
-            logger.error(f"Error in slash game request: {e}")
+            logger.error(f"Error in nsfwgame slash command: {e}")
+            await interaction.followup.send("❌ An error occurred while fetching the game. Please try again.")
+
+    @app_commands.command(name="nsfwlist", description="Search NSFW games across platforms")
+    @app_commands.describe(
+        query="Search term for games",
+        limit="Number of results to show (1-20)"
+    )
+    async def nsfwlist_slash(
+        self, 
+        interaction: discord.Interaction, 
+        query: str, 
+        limit: int = 5
+    ):
+        """Enhanced search with result limit control"""
+        if len(query) < 2:
+            await interaction.response.send_message("❌ Search query must be at least 2 characters long.", ephemeral=True)
+            return
+
+        if not 1 <= limit <= 20:
+            await interaction.response.send_message("❌ Limit must be between 1 and 20.", ephemeral=True)
+            return
+
+        await interaction.response.defer(thinking=True)
+
+        try:
+            games = await self._search_with_fallback(query, limit=limit)
+
+            if not games:
+                embed = discord.Embed(
+                    title="❌ No Results Found",
+                    description=f"No games found for '{query}'. Try different keywords!",
+                    color=discord.Color.red()
+                )
+                await interaction.followup.send(embed=embed)
+                return
 
             embed = discord.Embed(
-                title="💥 Oops! Something Went Wrong",
-                description="There was an error fetching games. Please try again later!",
-                color=discord.Color.red()
+                title=f"🔍 Search Results for '{query}'",
+                description=f"Found {len(games)} games across multiple platforms",
+                color=discord.Color.purple()
             )
-            embed.set_footer(text="If this persists, contact the bot administrator")
-            await interaction.edit_original_response(embed=embed)
 
-    async def _handle_game_request(self, ctx, site: str, tag: str, single: bool = True, page: int = 1):
-        """Enhanced unified handler for text command game requests"""
-        # Check if channel is NSFW
-        if not ctx.channel.is_nsfw():
+            for i, game in enumerate(games, 1):
+                rating_text = f" ⭐{game.rating:.1f}" if game.rating else ""
+                price_text = f" • {game.price}" if game.price and game.price != "Free" else ""
+
+                embed.add_field(
+                    name=f"{i}. {game.title}{rating_text}",
+                    value=f"[🔗 Play]({game.url}) • {game.platform.value}{price_text}\n{game.description[:100]}{'...' if len(game.description) > 100 else ''}",
+                    inline=False
+                )
+
+            await interaction.followup.send(embed=embed)
+
+        except Exception as e:
+            logger.error(f"Error in nsfwlist slash command: {e}")
+            await interaction.followup.send("❌ An error occurred while searching. Please try again.")
+
+    @app_commands.command(name="gamesearch", description="Advanced game search with filters")
+    @app_commands.describe(
+        query="Search term",
+        platform="Platform to search on",
+        min_rating="Minimum rating (0.0-5.0)",
+        category="Game category",
+        sort_by="Sort results by"
+    )
+    async def gamesearch_slash(
+        self,
+        interaction: discord.Interaction,
+        query: str,
+        platform: str = None,
+        min_rating: float = 0.0,
+        category: str = None,
+        sort_by: str = "relevance"
+    ):
+        """Advanced search with comprehensive filters"""
+        await interaction.response.defer(thinking=True)
+
+        try:
+            # Validate inputs
+            if len(query) < 2:
+                await interaction.followup.send("❌ Search query must be at least 2 characters long.")
+                return
+
+            if not 0.0 <= min_rating <= 5.0:
+                await interaction.followup.send("❌ Rating must be between 0.0 and 5.0.")
+                return
+
+            # Perform search
+            search_term = f"{query} {category}" if category else query
+
+            if platform and platform.upper() in [p.name for p in Platform]:
+                target_platform = Platform[platform.upper()]
+                if target_platform in self.apis:
+                    games = await self.apis[target_platform].search(search_term, limit=20)
+                else:
+                    await interaction.followup.send(f"❌ Platform '{platform}' is not available.")
+                    return
+            else:
+                games = await self._search_with_fallback(search_term, limit=20)
+
+            # Apply filters
+            filtered_games = []
+            for game in games:
+                if game.rating is not None and game.rating < min_rating:
+                    continue
+                if category and category.lower() not in (game.category or "").lower():
+                    continue
+                filtered_games.append(game)
+
+            # Sort results
+            if sort_by == "rating":
+                filtered_games.sort(key=lambda g: g.rating or 0, reverse=True)
+            elif sort_by == "date":
+                filtered_games.sort(key=lambda g: g.last_updated, reverse=True)
+            # Default is relevance (already sorted by search)
+
+            if not filtered_games:
+                embed = discord.Embed(
+                    title="❌ No Results Found",
+                    description="No games match your search criteria. Try adjusting your filters.",
+                    color=discord.Color.red()
+                )
+                await interaction.followup.send(embed=embed)
+                return
+
             embed = discord.Embed(
-                title="🚫 NSFW Channel Required",
-                description="This command only works in NSFW channels for safety!",
-                color=discord.Color.red()
+                title=f"🎯 Advanced Search: '{query}'",
+                description=f"Found {len(filtered_games)} games matching your criteria",
+                color=discord.Color.gold()
             )
-            return await ctx.send(embed=embed, delete_after=10)
 
-        # Validate site
-        site = site.lower()
-        valid_sites = ["itch", "f95", "dlsite"]
-        if site not in valid_sites:
-            embed = discord.Embed(
-                title="❌ Invalid Site",
-                description=f"Please choose from: `{', '.join(valid_sites)}`",
-                color=discord.Color.red()
-            )
-            return await ctx.send(embed=embed, delete_after=10)
+            # Show filters applied
+            filters = []
+            if platform: filters.append(f"Platform: {platform}")
+            if min_rating > 0: filters.append(f"Min Rating: {min_rating}")
+            if category: filters.append(f"Category: {category}")
+            if sort_by != "relevance": filters.append(f"Sort: {sort_by}")
 
-        # Show loading message
-        loading_msg = random.choice(self.loading_messages)
-        loading_embed = discord.Embed(
-            title="🔄 Searching...",
-            description=loading_msg,
+            if filters:
+                embed.add_field(name="🔧 Filters Applied", value=" • ".join(filters), inline=False)
+
+            for i, game in enumerate(filtered_games[:5], 1):
+                rating_text = f" ⭐{game.rating:.1f}" if game.rating else ""
+                price_text = f" • {game.price}" if game.price and game.price != "Free" else ""
+
+                embed.add_field(
+                    name=f"{i}. {game.title}{rating_text}",
+                    value=f"[🔗 Play]({game.url}) • {game.platform.value}{price_text}\n{game.description[:100]}{'...' if len(game.description) > 100 else ''}",
+                    inline=False
+                )
+
+            if len(filtered_games) > 5:
+                embed.set_footer(text=f"Showing top 5 of {len(filtered_games)} results")
+
+            await interaction.followup.send(embed=embed)
+
+        except Exception as e:
+            logger.error(f"Error in gamesearch slash command: {e}")
+            await interaction.followup.send("❌ An error occurred during advanced search.")
+
+    @app_commands.command(name="categories", description="Show NSFW game categories")
+    async def categories_slash(self, interaction: discord.Interaction):
+        """Show categories with enhanced formatting"""
+        embed = discord.Embed(
+            title="📂 Game Categories",
+            description="Available categories (🔥 = more popular)",
             color=discord.Color.blue()
         )
-        loading_message = await ctx.send(embed=loading_embed)
-        try:
-            # Fetch games based on site
-            games = []
-            if site == "itch":
-                tags = ["adult"]
-                if tag:
-                    # Check if tag matches a category
-                    if tag.lower() in self.game_categories:
-                        tags.extend(self.game_categories[tag.lower()]["tags"])
-                    else:
-                        tags.append(tag.lower())
-                games = await self._fetch_itch_games(tags, page)
 
-            elif site == "f95":
-                games = await self._fetch_f95_games(tag, page)
+        sorted_categories = sorted(self.categories.items(), key=lambda x: x[1], reverse=True)
 
-            elif site == "dlsite":
-                games = await self._fetch_dlsite_games(tag, page)
+        category_text = ""
+        for category, weight in sorted_categories:
+            popularity = "🔥" * min(3, weight)
+            category_text += f"{popularity} `{category}`\n"
 
-        except Exception as e:
-            self.logger.error(f"[GameFetcher] Error while fetching from {site}: {e}")
-            games = []   # fallback if error happens
+        embed.add_field(name="Categories", value=category_text, inline=False)
+        embed.add_field(
+            name="💡 Usage Tips",
+            value="• Use categories with `/nsfwgame`\n• Mix categories in `/gamesearch`\n• Popular categories have better results",
+            inline=False
+        )
 
+        await interaction.response.send_message(embed=embed)
 
-    
+    @app_commands.command(name="gamestats", description="Show bot usage statistics")
+    async def gamestats_slash(self, interaction: discord.Interaction):
+        """Enhanced statistics with more details"""
+        embed = discord.Embed(
+            title="📊 Bot Statistics",
+            color=discord.Color.green()
+        )
+
+        embed.add_field(name="🔍 Total Searches", value=f"{self.stats['searches']:,}", inline=True)
+        embed.add_field(name="🎮 Games Found", value=f"{self.stats['games_found']:,}", inline=True)
+        embed.add_field(name="⚡ Cache Hits", value=f"{self.stats['cache_hits']:,}", inline=True)
+        embed.add_field(name="❌ API Errors", value=f"{self.stats['api_errors']:,}", inline=True)
+
+        success_rate = ((self.stats['searches'] - self.stats['api_errors']) / max(1, self.stats['searches']) * 100)
+        embed.add_field(name="🎯 Success Rate", value=f"{success_rate:.1f}%", inline=True)
+        embed.add_field(name="🌐 Active APIs", value=len(self.apis), inline=True)
+
+        # Additional stats
+        avg_games_per_search = self.stats['games_found'] / max(1, self.stats['searches'])
+        embed.add_field(name="📈 Avg Games/Search", value=f"{avg_games_per_search:.1f}", inline=True)
+
+        cache_hit_rate = (self.stats['cache_hits'] / max(1, self.stats['searches']) * 100)
+        embed.add_field(name="💾 Cache Hit Rate", value=f"{cache_hit_rate:.1f}%", inline=True)
+
+        # Platform status
+        platform_status = "\n".join([f"✅ {platform.value}" for platform in self.apis.keys()])
+        embed.add_field(name="🔌 Platform Status", value=platform_status, inline=False)
+
+        await interaction.response.send_message(embed=embed)
+
+    @app_commands.command(name="gameprefs", description="Set your game preferences")
+    @app_commands.describe(
+        favorite_category="Your favorite game category",
+        preferred_platform="Your preferred platform",
+        min_rating="Minimum rating for recommendations"
+    )
+    async def gameprefs_slash(
+        self,
+        interaction: discord.Interaction,
+        favorite_category: str = None,
+        preferred_platform: str = None,
+        min_rating: float = 0.0
+    ):
+        """User preferences system (uses in-memory storage)"""
+        user_id = str(interaction.user.id)
+
+        if not hasattr(self, 'user_prefs'):
+            self.user_prefs = {}
+
+        if not any([favorite_category, preferred_platform, min_rating > 0]):
+            # Show current preferences
+            prefs = self.user_prefs.get(user_id, {})
+            if not prefs:
+                await interaction.response.send_message("❌ You haven't set any preferences yet. Use the command options to set them!")
+                return
+
+            embed = discord.Embed(
+                title="⚙️ Your Game Preferences",
+                color=discord.Color.blue()
+            )
+
+            if 'favorite_category' in prefs:
+                embed.add_field(name="📂 Favorite Category", value=prefs['favorite_category'], inline=True)
+            if 'preferred_platform' in prefs:
+                embed.add_field(name="🎮 Preferred Platform", value=prefs['preferred_platform'], inline=True)
+            if 'min_rating' in prefs:
+                embed.add_field(name="⭐ Min Rating", value=f"{prefs['min_rating']:.1f}", inline=True)
+
+            embed.set_footer(text="These preferences will be used for personalized recommendations")
+            await interaction.response.send_message(embed=embed)
+            return
+
+        # Set preferences
+        if user_id not in self.user_prefs:
+            self.user_prefs[user_id] = {}
+
+        changes = []
+        if favorite_category:
+            self.user_prefs[user_id]['favorite_category'] = favorite_category
+            changes.append(f"Favorite category: {favorite_category}")
+
+        if preferred_platform:
+            self.user_prefs[user_id]['preferred_platform'] = preferred_platform
+            changes.append(f"Preferred platform: {preferred_platform}")
+
+        if min_rating > 0:
+            self.user_prefs[user_id]['min_rating'] = min_rating
+            changes.append(f"Minimum rating: {min_rating}")
+
+        embed = discord.Embed(
+            title="✅ Preferences Updated",
+            description="Your preferences have been saved:\n• " + "\n• ".join(changes),
+            color=discord.Color.green()
+        )
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ============= AUTOCOMPLETE =============
+
+    @nsfwgame_slash.autocomplete('category')
+    @gamesearch_slash.autocomplete('category')
+    async def category_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+        """Autocomplete for game categories"""
+        categories = list(self.categories.keys())
+        return [
+            app_commands.Choice(name=category, value=category)
+            for category in categories
+            if current.lower() in category.lower()
+        ][:25]
+
+    @nsfwgame_slash.autocomplete('platform')
+    @gamesearch_slash.autocomplete('platform')
+    @gameprefs_slash.autocomplete('preferred_platform')
+    async def platform_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+        """Autocomplete for platforms"""
+        platforms = [platform.value for platform in Platform if platform in self.apis]
+        return [
+            app_commands.Choice(name=platform, value=platform)
+            for platform in platforms
+            if current.lower() in platform.lower()
+        ][:25]
+
+    @gamesearch_slash.autocomplete('sort_by')
+    async def sort_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+        """Autocomplete for sort options"""
+        sort_options = ["relevance", "rating", "date"]
+        return [
+            app_commands.Choice(name=option.title(), value=option)
+            for option in sort_options
+            if current.lower() in option.lower()
+        ]
+
+    @gameprefs_slash.autocomplete('favorite_category')
+    async def prefs_category_autocomplete(self, interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+        """Autocomplete for preference categories"""
+        return await self.category_autocomplete(interaction, current)
+
+    # ============= PREFIX COMMANDS (for backward compatibility) =============
+
+    @commands.command(name="nsfwgame")
+    async def nsfwgame(self, ctx, *, category: str = None):
+        """Get random NSFW game (prefix version)"""
+        # Create a mock interaction for code reuse
+        class MockInteraction:
+            def __init__(self, ctx):
+                self.user = ctx.author
+                self.response = MockResponse(ctx)
+                self.followup = MockFollowup(ctx)
+
+        class MockResponse:
+            def __init__(self, ctx):
+                self.ctx = ctx
+                self._deferred = False
+
+            async def defer(self, thinking=False):
+                self._deferred = True
+                if hasattr(self.ctx, 'typing'):
+                    return self.ctx.typing()
+
+            async def send_message(self, *args, **kwargs):
+                return await self.ctx.send(*args, **kwargs)
+
+        class MockFollowup:
+            def __init__(self, ctx):
+                self.ctx = ctx
+
+            async def send(self, *args, **kwargs):
+                return await self.ctx.send(*args, **kwargs)
+
+        mock_interaction = MockInteraction(ctx)
+        await self.nsfwgame_slash(mock_interaction, category)
+
+    @commands.command(name="nsfwlist")
+    async def nsfwlist(self, ctx, *, query: str):
+        """Search NSFW games (prefix version)"""
+        class MockInteraction:
+            def __init__(self, ctx):
+                self.user = ctx.author
+                self.response = MockResponse(ctx)
+                self.followup = MockFollowup(ctx)
+
+        class MockResponse:
+            def __init__(self, ctx):
+                self.ctx = ctx
+
+            async def defer(self, thinking=False):
+                if hasattr(self.ctx, 'typing'):
+                    return self.ctx.typing()
+
+            async def send_message(self, *args, **kwargs):
+                return await self.ctx.send(*args, **kwargs)
+
+        class MockFollowup:
+            def __init__(self, ctx):
+                self.ctx = ctx
+
+            async def send(self, *args, **kwargs):
+                return await self.ctx.send(*args, **kwargs)
+
+        mock_interaction = MockInteraction(ctx)
+        await self.nsfwlist_slash(mock_interaction, query)
+
+    @commands.command(name="categories")
+    async def categories_cmd(self, ctx):
+        """Show categories (prefix version)"""
+        class MockInteraction:
+            def __init__(self, ctx):
+                self.response = MockResponse(ctx)
+
+        class MockResponse:
+            def __init__(self, ctx):
+                self.ctx = ctx
+
+            async def send_message(self, *args, **kwargs):
+                return await self.ctx.send(*args, **kwargs)
+
+        mock_interaction = MockInteraction(ctx)
+        await self.categories_slash(mock_interaction)
+
+    @commands.command(name="gamestats")
+    async def gamestats(self, ctx):
+        """Show stats (prefix version)"""
+        class MockInteraction:
+            def __init__(self, ctx):
+                self.response = MockResponse(ctx)
+
+        class MockResponse:
+            def __init__(self, ctx):
+                self.ctx = ctx
+
+            async def send_message(self, *args, **kwargs):
+                return await self.ctx.send(*args, **kwargs)
+
+        mock_interaction = MockInteraction(ctx)
+        await self.gamestats_slash(mock_interaction)
+
 async def setup(bot):
-    """Setup function to add cog to bot"""
-    await bot.add_cog(NSFWGames(bot))
+    """Setup function for the cog"""
+    await bot.add_cog(NSFWGameCog(bot))
