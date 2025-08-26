@@ -7,20 +7,17 @@ import asyncio
 from discord.ext import commands
 from dotenv import load_dotenv
 from database import Database
-from keep_alive import keep_alive
+
+# --- Load .env ---
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# === Start keep_alive ===
-keep_alive()
-
 # === Load token from environment ===
 TOKEN = os.getenv("DISCORD_TOKEN")
-
 if not TOKEN:
     logging.critical("DISCORD_TOKEN not found in environment variables!")
-    logging.critical("Please add DISCORD_TOKEN to your Replit secrets.")
     exit(1)
 
 # === Intents & Prefix ===
@@ -46,12 +43,10 @@ class Bot(commands.Bot):
         """Called when the bot is starting up"""
         logging.info("Setting up bot extensions...")
 
-        # Create cogs directory if it doesn't exist
         if not os.path.exists("cogs"):
             os.makedirs("cogs")
             logging.warning("Created missing cogs directory")
 
-        # Load all cogs
         loaded_cogs = []
         for filename in os.listdir("cogs"):
             if filename.endswith(".py") and not filename.startswith("__"):
@@ -68,7 +63,6 @@ class Bot(commands.Bot):
         """Called when the bot is ready"""
         logging.info(f"✅ Logged in as {self.user} (ID: {self.user.id})")
 
-        # Wait a moment for everything to be ready
         await asyncio.sleep(2)
 
         # Sync slash commands
@@ -79,7 +73,6 @@ class Bot(commands.Bot):
         except Exception as e:
             logging.error(f"❌ Failed to sync slash commands: {e}")
 
-        # Set bot presence
         await self.change_presence(
             activity=discord.Activity(
                 type=discord.ActivityType.watching, 
@@ -87,13 +80,11 @@ class Bot(commands.Bot):
             )
         )
 
-        # Show connected guilds
         print("🔗 Connected to the following servers:")
         for guild in self.guilds:
             print(f" - {guild.name} (ID: {guild.id}) - {len(guild.members)} members")
 
     async def process_commands(self, message):
-        """Process commands with duplicate prevention"""
         if message.id in self.processing_commands:
             return
         self.processing_commands.add(message.id)
@@ -103,17 +94,15 @@ class Bot(commands.Bot):
             self.processing_commands.discard(message.id)
 
     def uptime(self):
-        """Get bot uptime in seconds"""
         return int(time.time() - self.start_time)
 
-# Initialize bot
+
+# === Initialize bot ===
 bot = Bot()
 
-# === Events & Commands ===
-
+# === Commands ===
 @bot.command(name="uptime")
 async def uptime_command(ctx):
-    """Show bot uptime"""
     uptime_seconds = bot.uptime()
     minutes, seconds = divmod(uptime_seconds, 60)
     hours, minutes = divmod(minutes, 60)
@@ -128,14 +117,12 @@ async def uptime_command(ctx):
 
 @bot.command(name="ping")
 async def ping_command(ctx):
-    """Show bot latency"""
     latency = round(bot.latency * 1000)
     await ctx.send(f"🏓 Pong! Latency: {latency}ms")
 
 @bot.command(name="reload")
 @commands.is_owner()
 async def reload_cogs(ctx, cog_name: str = None):
-    """Reload a specific cog or all cogs (Owner only)"""
     if cog_name:
         try:
             await bot.reload_extension(f"cogs.{cog_name}")
@@ -156,7 +143,6 @@ async def reload_cogs(ctx, cog_name: str = None):
 @bot.command(name="sync")
 @commands.is_owner()
 async def sync_commands(ctx):
-    """Manually sync slash commands (Owner only)"""
     try:
         synced = await bot.tree.sync()
         await ctx.send(f"✅ Synced {len(synced)} slash commands")
@@ -164,12 +150,9 @@ async def sync_commands(ctx):
         await ctx.send(f"❌ Failed to sync commands: {e}")
 
 # === Error Handlers ===
-
 @bot.event
 async def on_command_error(ctx, error):
-    """Handle command errors"""
     if isinstance(error, commands.CommandNotFound):
-        # Don't log unknown commands, just ignore them
         return
     elif isinstance(error, commands.NotOwner):
         await ctx.send("❌ This command is owner-only!")
@@ -188,26 +171,21 @@ async def on_command_error(ctx, error):
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error):
-    """Handle slash command errors"""
     logging.error(f"Slash command error: {error}", exc_info=True)
-
-    error_msg = "⚠️ An error occurred with this command"
-
     try:
         if not interaction.response.is_done():
-            await interaction.response.send_message(error_msg, ephemeral=True)
+            await interaction.response.send_message("⚠️ An error occurred with this command", ephemeral=True)
         else:
-            await interaction.followup.send(error_msg, ephemeral=True)
+            await interaction.followup.send("⚠️ An error occurred with this command", ephemeral=True)
     except Exception as e:
         logging.error(f"Error handling slash command error: {e}")
 
-# === Run the bot ===
+# === Run bot ===
 if __name__ == "__main__":
     try:
         logging.info("Starting bot...")
-        keep_alive()  # Start Flask server to keep bot alive
         bot.run(TOKEN)
     except KeyboardInterrupt:
-        logging.info("Bot shutdown initiated by keyboard interrupt")
+        logging.info("Bot shutdown by keyboard interrupt")
     except Exception as e:
         logging.critical(f"Fatal error: {e}", exc_info=True)
